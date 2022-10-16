@@ -4,18 +4,38 @@ using NFive.PluginManager.Utilities;
 using NFive.SDK.Server;
 using NFive.SDK.Server.Storage;
 using System;
+using System.CodeDom.Compiler;
 using System.Collections.Generic;
-using System.Data.Entity;
-using System.Data.Entity.Infrastructure;
-using System.Data.Entity.Migrations;
-using System.Data.Entity.Migrations.Design;
-using System.Data.Entity.Migrations.Model;
-using System.Data.Entity.Migrations.Utilities;
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore.Design.Internal;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Diagnostics.Internal;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Internal;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Migrations.Design;
+using Microsoft.EntityFrameworkCore.Migrations.Internal;
+using Microsoft.EntityFrameworkCore.Scaffolding;
+using Microsoft.EntityFrameworkCore.Scaffolding.Internal;
+using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.EntityFrameworkCore.Storage.Internal;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Design;
+
+using Microsoft.EntityFrameworkCore.Migrations.Operations;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using JetBrains.Annotations;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
+using NFive.PluginManager.Extensions;
 
 namespace NFive.PluginManager.Modules
 {
@@ -139,7 +159,7 @@ namespace NFive.PluginManager.Modules
 							p.PropertyType.IsGenericType &&
 							p.PropertyType.GetGenericTypeDefinition() == typeof(DbSet<>) &&
 							p.PropertyType.GenericTypeArguments.Any(t => !string.IsNullOrEmpty(t.Namespace) && t.Namespace.StartsWith("NFive.SDK."))) // TODO
-						.Select(t => $"dbo.{t.Name}") // TODO
+						.Select(t => $"{t.Name}") // TODO
 						.ToArray();
 
 					if (!this.Sdk) Console.WriteLine($"    Excluding tables: {string.Join(", ", props)}");
@@ -150,58 +170,58 @@ namespace NFive.PluginManager.Modules
 
 					var @namespace = $"{project.Properties.Item("RootNamespace").Value}.{migrationsPath}";
 
-					if (asm.DefinedTypes.Any(t => t.BaseType != null && t.BaseType == typeof(DbMigration) && t.Namespace == @namespace && t.Name == this.Name))
+					if (asm.DefinedTypes.Any(t => t.BaseType != null && t.BaseType == typeof(Migration) && t.Namespace == @namespace && t.Name == this.Name))
 					{
 						throw new Exception($"A migration named \"{this.Name}\" already exists at \"{@namespace}.{this.Name}\", please use another migration name.");
 					}
 
 					Console.WriteLine("    Generating migration...");
 
-					var migrationsConfiguration = new DbMigrationsConfiguration
-					{
-						AutomaticMigrationDataLossAllowed = false,
-						AutomaticMigrationsEnabled = false,
-						CodeGenerator = new NFiveMigrationCodeGenerator(this.Sdk ? new string[] { } : props),
-						ContextType = contextType,
-						ContextKey = $"{@namespace}.Configuration",
-						MigrationsAssembly = asm,
-						MigrationsDirectory = migrationsPath,
-						MigrationsNamespace = @namespace,
-						TargetDatabase = new DbConnectionInfo(this.Database, "MySql.Data.MySqlClient")
-					};
+					var serviceCollection = new ServiceCollection();
+					serviceCollection.AddTransient<IMigrationsCodeGenerator, NFiveMigrationCodeGenerator>();
+					serviceCollection.AddEntityFrameworkDesignTimeServices(this.Sdk ? new string[] {} : props);
 
-					var ms = new MigrationScaffolder(migrationsConfiguration);
-					
+					serviceCollection.AddDbContextDesignTimeServices((DbContext)Activator.CreateInstance(contextType));
+					var serviceProvider = serviceCollection.BuildServiceProvider();
+					var migrationsScaffolder = serviceProvider.GetService<IMigrationsScaffolder>();
+
 					if (this.RunMigrations)
 					{
-						var migrator = new DbMigrator(migrationsConfiguration);
-
-						if (migrator.GetPendingMigrations().Any())
+						var context = serviceProvider.GetService<DbContext>();
+						
+						if ((await context.Database.GetPendingMigrationsAsync()).Any())
 						{
 							Console.WriteLine("    Running existing migrations...");
 
-							foreach (var migration in migrator.GetPendingMigrations())
-							{
-								Console.WriteLine($"        Running migration: {migration}");
+							await context.Database.MigrateAsync();
 
-								migrator.Update(migration);
+							foreach (var migration in await context.Database.GetAppliedMigrationsAsync())
+							{
+								Console.WriteLine($"        Applied migration: {migration}");
 							}
 						}
 					}
 
 					Console.WriteLine("    Scaffolding migration...");
 
-					var src = ms.Scaffold(this.Name, false);
+					var src = migrationsScaffolder.ScaffoldMigration(this.Name, @namespace);
 
-					var file = Path.Combine(projectPath, migrationsPath, $"{src.MigrationId}.{src.Language}");
+					var migrationFile = Path.Combine(projectPath, migrationsPath, $"{src.MigrationId}{src.FileExtension}");
+					var metadataFile = Path.Combine(projectPath, migrationsPath,
+						$"{src.MigrationId}.Designer{src.FileExtension}");
 
-					Console.WriteLine($"    Writing migration: {file}");
+					Console.WriteLine($"    Writing migration: {migrationFile}");
 
-					File.WriteAllText(file, src.UserCode);
+					File.WriteAllText(migrationFile, src.MigrationCode);
+
+					Console.WriteLine($"    Writing migration metadata: {metadataFile}");
+
+					File.WriteAllText(metadataFile, src.MetadataCode);
 
 					Console.WriteLine("    Updating project...");
 
-					project.ProjectItems.AddFromFile(file);
+					project.ProjectItems.AddFromFile(migrationFile);
+					project.ProjectItems.AddFromFile(metadataFile);
 					project.Save();
 				}
 
@@ -240,90 +260,139 @@ namespace NFive.PluginManager.Modules
 		}
 
 		/// <inheritdoc />
-		public class NFiveMigrationCodeGenerator : CSharpMigrationCodeGenerator
+		public class NFiveMigrationCodeGenerator : CSharpMigrationsGenerator
 		{
 			protected IEnumerable<string> ExcludedModels;
-			protected string MigrationId;
-			protected string SourceModel;
-			protected string TargetModel;
 
 			/// <inheritdoc />
-			public NFiveMigrationCodeGenerator(IEnumerable<string> excludedModels)
+			public NFiveMigrationCodeGenerator(IEnumerable<string> excludedModels, MigrationsCodeGeneratorDependencies dependencies, CSharpMigrationsGeneratorDependencies cSharpDependencies)
+			:base(dependencies, cSharpDependencies)
 			{
 				this.ExcludedModels = excludedModels;
 			}
-
-			/// <inheritdoc />
-			public override ScaffoldedMigration Generate(string migrationId, IEnumerable<MigrationOperation> operations, string sourceModel, string targetModel, string @namespace, string className)
+			
+			/// <summary>
+			///     Generates the migration code.
+			/// </summary>
+			/// <param name="migrationNamespace">The migration's namespace.</param>
+			/// <param name="migrationName">The migration's name.</param>
+			/// <param name="upOperations">The migration's up operations.</param>
+			/// <param name="downOperations">The migration's down operations.</param>
+			/// <returns>The migration code.</returns>
+			public override string GenerateMigration(
+				string migrationNamespace,
+				string migrationName,
+				IReadOnlyList<MigrationOperation> upOperations,
+				IReadOnlyList<MigrationOperation> downOperations)
 			{
-				this.MigrationId = migrationId;
-				this.SourceModel = sourceModel;
-				this.TargetModel = targetModel;
+				var filteredUp = FilterMigrationOperations(upOperations).ToImmutableList();
+				var filteredDown = FilterMigrationOperations(downOperations).ToImmutableList();
 
-				return base.Generate(migrationId, FilterMigrationOperations(operations.ToList()), sourceModel, targetModel, @namespace, className);
+				return InternalGenerateMigration(migrationNamespace, migrationName, filteredUp, filteredDown);
 			}
 
-			/// <inheritdoc />
-			protected override void WriteClassStart(string @namespace, string className, IndentedTextWriter writer, string @base, bool designer = false, IEnumerable<string> namespaces = null)
+			private string InternalGenerateMigration(string migrationNamespace, string migrationName,
+				IReadOnlyList<MigrationOperation> upOperations, IReadOnlyList<MigrationOperation> downOperations)
 			{
-				if (writer == null) throw new ArgumentException(nameof(writer));
-				if (string.IsNullOrWhiteSpace(className)) throw new ArgumentException(nameof(className));
-				if (string.IsNullOrWhiteSpace(@base)) throw new ArgumentException(nameof(@base));
-
-				writer.WriteLine("// <auto-generated />");
-				writer.WriteLine("// ReSharper disable all");
-				writer.WriteLine();
-
-				foreach (var ns in (namespaces ?? GetDefaultNamespaces(designer)).Distinct().OrderBy(n => n)) writer.WriteLine("using " + ns + ";");
-				writer.WriteLine("using System.CodeDom.Compiler;");
-				writer.WriteLine("using System.Data.Entity.Migrations.Infrastructure;");
-				writer.WriteLine();
-
-				if (!string.IsNullOrWhiteSpace(@namespace))
+				var builder = new IndentedStringBuilder();
+				var namespaces = new List<string> { "Microsoft.EntityFrameworkCore.Migrations" };
+				namespaces.AddRange(GetNamespaces(upOperations.Concat(downOperations)));
+				foreach (var n in namespaces.OrderBy(x => x, new NamespaceComparer()).Distinct())
 				{
-					writer.Write("namespace ");
-					writer.WriteLine(@namespace);
-					writer.WriteLine("{");
-					++writer.Indent;
+					builder
+						.Append("using ")
+						.Append(n)
+						.AppendLine(";");
+				}
+				builder.AppendLine("using System.CodeDom.Compiler;");
+				builder.AppendLine();
+
+				// Suppress "Prefer jagged arrays over multidimensional" when we have a seeding operation with a multidimensional array
+				if (HasMultidimensionalArray(upOperations.Concat(downOperations)))
+				{
+					builder
+						.AppendLine()
+						.AppendLine("#pragma warning disable CA1814 // Prefer jagged arrays over multidimensional");
 				}
 
-				WriteClassAttributes(writer, designer);
-				writer.Write("public ");
-				if (designer) writer.Write("sealed partial ");
-				writer.Write("class ");
-				writer.Write(className);
-				writer.Write(" : ");
-				writer.Write(@base);
-				writer.WriteLine(", IMigrationMetadata");
-				writer.WriteLine("{");
-				++writer.Indent;
+				if (!string.IsNullOrEmpty(migrationNamespace))
+				{
+					builder
+						.AppendLine()
+						.Append("namespace ").AppendLine(this.CSharpDependencies.CSharpHelper.Namespace(migrationNamespace))
+						.AppendLine("{")
+						.IncrementIndent();
+				}
 
-				writer.Write($"string IMigrationMetadata.Id => \"{this.MigrationId}\";");
-				writer.WriteLine();
-				writer.WriteLine();
-				writer.Write($"string IMigrationMetadata.Source => {(this.SourceModel == null ? "null" : $"\"{this.TargetModel}\"")};");
-				writer.WriteLine();
-				writer.WriteLine();
-				writer.Write($"string IMigrationMetadata.Target => \"{this.TargetModel}\";");
-				writer.WriteLine();
-				writer.WriteLine();
+				builder
+					.AppendLine("/// <inheritdoc />")
+					.AppendLine($"[GeneratedCode(\"NFive.Migration\", \"{typeof(NFiveMigrationCodeGenerator).GetTypeInfo().Assembly.GetCustomAttributes<AssemblyInformationalVersionAttribute>().Single().InformationalVersion}\")]")
+					.Append("public partial class ").Append(CSharpDependencies.CSharpHelper.Identifier(migrationName)).AppendLine(" : Migration")
+					.AppendLine("{");
+				using (builder.Indent())
+				{
+					builder
+						.AppendLine("/// <inheritdoc />")
+						.AppendLine("protected override void Up(MigrationBuilder migrationBuilder)")
+						.AppendLine("{");
+					using (builder.Indent())
+					{
+						CSharpDependencies.CSharpMigrationOperationGenerator.Generate("migrationBuilder", upOperations, builder);
+					}
+
+					builder
+						.AppendLine()
+						.AppendLine("}")
+						.AppendLine()
+						.AppendLine("/// <inheritdoc />")
+						.AppendLine("protected override void Down(MigrationBuilder migrationBuilder)")
+						.AppendLine("{");
+					using (builder.Indent())
+					{
+						CSharpDependencies.CSharpMigrationOperationGenerator.Generate("migrationBuilder", downOperations, builder);
+					}
+
+					builder
+						.AppendLine()
+						.AppendLine("}");
+				}
+
+				builder.AppendLine("}");
+
+				if (!string.IsNullOrEmpty(migrationNamespace))
+				{
+					builder
+						.DecrementIndent()
+						.AppendLine("}");
+				}
+
+				return builder.ToString();
 			}
 
-			/// <inheritdoc />
-			protected override void WriteClassAttributes(IndentedTextWriter writer, bool designer)
+			private bool HasMultidimensionalArray(IEnumerable<MigrationOperation> operations)
 			{
-				writer.WriteLine($"[GeneratedCode(\"NFive.Migration\", \"{typeof(NFiveMigrationCodeGenerator).GetTypeInfo().Assembly.GetCustomAttributes<AssemblyInformationalVersionAttribute>().Single().InformationalVersion}\")]");
-			}
+				return operations.Any(
+					o =>
+						(o is InsertDataOperation insertDataOperation
+						 && IsMultidimensional(insertDataOperation.Values))
+						|| (o is UpdateDataOperation updateDataOperation
+						    && (IsMultidimensional(updateDataOperation.Values) || IsMultidimensional(updateDataOperation.KeyValues)))
+						|| (o is DeleteDataOperation deleteDataOperation
+						    && IsMultidimensional(deleteDataOperation.KeyValues)));
 
-			private IEnumerable<MigrationOperation> FilterMigrationOperations(List<MigrationOperation> operations)
+				static bool IsMultidimensional(Array array)
+					=> array.GetLength(0) > 1 && array.GetLength(1) > 1;
+			}
+			
+			private IEnumerable<MigrationOperation> FilterMigrationOperations(IReadOnlyList<MigrationOperation> operations)
 			{
 				var exceptions = new IEnumerable<MigrationOperation>[]
 				{
 					operations.OfType<CreateTableOperation>().Where(op => this.ExcludedModels.Contains(op.Name)),
 					operations.OfType<DropTableOperation>().Where(op => this.ExcludedModels.Contains(op.Name)),
 
-					operations.OfType<AddForeignKeyOperation>().Where(op => this.ExcludedModels.Contains(op.DependentTable)),
-					operations.OfType<DropForeignKeyOperation>().Where(op => this.ExcludedModels.Contains(op.DependentTable)),
+					operations.OfType<AddForeignKeyOperation>().Where(op => this.ExcludedModels.Contains(op.PrincipalTable)),
+					operations.OfType<DropForeignKeyOperation>().Where(op => this.ExcludedModels.Contains(op.Table)),
 
 					operations.OfType<CreateIndexOperation>().Where(op => this.ExcludedModels.Contains(op.Table)),
 					operations.OfType<DropIndexOperation>().Where(op => this.ExcludedModels.Contains(op.Table))
@@ -331,6 +400,8 @@ namespace NFive.PluginManager.Modules
 
 				return operations.Except(exceptions.SelectMany(o => o));
 			}
+
+			public override string FileExtension { get; } = ".cs";
 		}
 	}
 }
