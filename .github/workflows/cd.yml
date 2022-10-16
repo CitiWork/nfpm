@@ -54,7 +54,7 @@ jobs:
 
       - uses: vimtor/action-zip@v1
         with:
-          files: src/Build/
+          files: src/Build/nfpm.exe
           dest: ${{ env.ZipName }}
 
       # Create a Release on the GitHub project
