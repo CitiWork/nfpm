@@ -50,7 +50,7 @@ jobs:
         run: nuget restore PluginManager.sln
 
       - name: Build the solution
-        run: msbuild PluginManager.sln /p:Configuration=Release /p:Outdir=Build
+        run: msbuild PluginManager.sln /t:PluginManager /p:Configuration=Release /p:Outdir=Build
 
       - uses: vimtor/action-zip@v1
         with:

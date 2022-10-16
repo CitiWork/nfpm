@@ -53,7 +53,7 @@ jobs:
         run: nuget restore PluginManager.sln
 
       - name: Build the solution
-        run: msbuild PluginManager.sln /p:Configuration=Release /p:Outdir=Build
+        run: msbuild PluginManager.sln /t:PluginManager /p:Configuration=Release /p:Outdir=Build
 
       - name: Attach Zip as build artifact
         uses: actions/upload-artifact@v3.1.0
