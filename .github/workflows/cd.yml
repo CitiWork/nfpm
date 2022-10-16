@@ -54,7 +54,7 @@ jobs:
 
       - uses: vimtor/action-zip@v1
         with:
-          files: Build/
+          files: src/Build/
           dest: ${{ env.ZipName }}
 
       # Create a Release on the GitHub project
